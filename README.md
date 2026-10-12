@@ -22,6 +22,12 @@ Monthly refresh: point `RA_PLANET` at the new planet and run `pipeline/refresh.s
 region to `REGIONS` in `pipeline/build.py`, then `pipeline/refresh.sh <group> <region>`. `docs/rust-pipeline.md` describes the extraction and build pipeline in depth (design, code, optimizations, how to reuse it). `CLAUDE.md` explains the data format, the station model,
 the checks each build prints and the timings.
 
+## Deploy
+
+The site is static, so any static host works. On Vercel: import the repository, set **Root Directory** to `site` and leave the build command empty;
+`site/vercel.json` sets the cache headers (data files are cached for an hour, then revalidated). The data is built locally with
+`pipeline/refresh.sh` and committed, so a monthly refresh is: run it, commit `site/data/`, push; Vercel redeploys on its own.
+
 ## Test
 
     pip install -r requirements-dev.txt
