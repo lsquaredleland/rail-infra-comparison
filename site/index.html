@@ -136,6 +136,7 @@ table.cmp td.txt { font-variant-numeric: normal; font-size: 12.5px; }
 .mapwrap { position: relative; min-width: 0; background: var(--map); overflow: hidden; order: 1; }
 canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 canvas.dragging { cursor: grabbing; }
+#over { position: absolute; inset: 0; pointer-events: none; }
 .hud { position: absolute; left: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
 .scalebar { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px 5px; font: 600 12px var(--font-display); letter-spacing: 0.03em; font-variant-numeric: tabular-nums; }
 .scalebar .bar { height: 5px; border: 1.5px solid var(--ink); border-top: 0; margin-top: 3px; }
@@ -207,6 +208,7 @@ canvas.dragging { cursor: grabbing; }
 <div class="app">
   <div class="mapwrap" id="mapwrap">
     <canvas id="map" tabindex="0" aria-label="Overlay map of the selected cities at the same scale. Tab selects a city, Q and E rotate it, R resets, Escape deselects."></canvas>
+    <canvas id="over" aria-hidden="true"></canvas>
     <div class="loading" id="loading">Loading map data</div>
     <div class="tip" id="tip" hidden></div>
     <aside class="stview" id="stview" hidden aria-label="Station view"></aside>
@@ -357,8 +359,9 @@ const state = { slots: [{ id: 'sf', ci: 0, off: { x: 0, y: 0 } }, { id: 'tky23',
   modeOff: new Set(), hidden: {}, tab: 0, filter: '', sel: null, snapDeg: null,
   view: { cx: 0, cy: 0, s: 0.02, r: 0 } };
 const cache = {};
-const canvas = document.getElementById('map');
-const ctx = canvas.getContext('2d');
+const canvas = document.getElementById('map'), over = document.getElementById('over');
+const baseCtx = canvas.getContext('2d'), overCtx = over.getContext('2d');
+let ctx = baseCtx;   // the context drawing helpers use: the map layer, or the overlay while renderOverlay runs
 let W = 0, H = 0, DPR = 1, colors = {}, hitList = [];
 
 function readColors() {
@@ -381,26 +384,70 @@ function addLine(p, pts, close) {
   if (close) p.closePath();
 }
 
+// Culling. The browser strokes (and dashes) a whole path, off-screen parts included; at close zoom a dashed outline of a big region is
+// millions of dashes and a frame takes seconds. So every stroked line is kept as short pieces (at most `step` vertices and about `maxLen`
+// metres, bounding box each; long edges are split); a frame strokes only the pieces that touch the screen, or the whole path when most of
+// it is visible. The whole path is built from the same pieces, so dashes (which restart at each piece) fall in the same place whichever is
+// drawn, and a line does not change look when it crosses the half-visible threshold.
+function chunkInto(list, pts, close, step = 96, maxLen = 1500) {
+  const n = pts.length / 2;
+  if (n < 2) return;
+  let p, cnt, len, x0, y0, x1, y1, px, py;
+  const start = (x, y) => { p = new Path2D(); p.moveTo(x, y); cnt = 1; len = 0; x0 = x1 = px = x; y0 = y1 = py = y; };
+  const to = (x, y) => {
+    p.lineTo(x, y); cnt++; len += Math.hypot(x - px, y - py); px = x; py = y;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (cnt > step || len >= maxLen) { list.push({ x0, y0, x1, y1, p }); start(x, y); }
+  };
+  start(pts[0], pts[1]);
+  for (let i = 1, e = close ? n : n - 1; i <= e; i++) {
+    const ax = px, ay = py, bx = pts[2 * (i % n)], by = pts[2 * (i % n) + 1];
+    const k = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / maxLen));
+    for (let j = 1; j <= k; j++) to(ax + (bx - ax) * j / k, ay + (by - ay) * j / k);
+  }
+  if (cnt > 1) list.push({ x0, y0, x1, y1, p });
+}
+function joinPieces(pieces) { const p = new Path2D(); for (const g of pieces) p.addPath(g.p); return p; }
+function culledLines(encLines, u, close = false) {
+  const pieces = [];
+  for (const l of encLines) chunkInto(pieces, decode(l, u), close);
+  return { whole: joinPieces(pieces), pieces };
+}
+function pickPieces(pieces, whole, vp) {
+  if (pieces.length < 6) return whole;
+  const keep = [];
+  for (const g of pieces) if (g.x1 >= vp[0] && g.x0 <= vp[2] && g.y1 >= vp[1] && g.y0 <= vp[3]) keep.push(g);
+  if (keep.length > pieces.length * 0.5) return whole;
+  if (!keep.length) return null;
+  const p = new Path2D();
+  for (const g of keep) p.addPath(g.p);
+  return p;
+}
+const cullPath = (o, vp) => pickPieces(o.pieces, o.whole, vp);
+
 function prepare(d) {
   const u = d.unit;
-  const land = new Path2D();
+  const land = new Path2D(), landP = [];
   let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
   for (const poly of d.land) for (const r of poly) {
-    const pts = decode(r, u); addLine(land, pts, true);
+    const pts = decode(r, u); addLine(land, pts, true); chunkInto(landP, pts, true);
     for (let i = 0; i < pts.length; i += 2) { const x = pts[i], y = pts[i + 1];
       if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y; }
   }
-  const legal = new Path2D();
-  for (const poly of d.legal) for (const r of poly) addLine(legal, decode(r, u), true);
-  const divs = new Path2D();
-  for (const l of (d.divs || [])) addLine(divs, decode(l, u), false);
-  const roads = d.roads.map(cls => { const p = new Path2D(); for (const l of cls) addLine(p, decode(l, u), false); return p; });
+  const legal = culledLines(d.legal.flat(), u, true), divs = culledLines(d.divs || [], u);
+  const roads = d.roads.map(cls => culledLines(cls, u));
   // rail: one pair of paths (inside / outside the limits) per named line
-  const lines = d.lines.map(([m, name, colour, km, ms, built, bsrc], i) => ({ i, m, name, colour, km, ms: ms || 0, built: built || '', bsrc: bsrc || '', pIn: new Path2D(), pOut: new Path2D(), nIn: 0, nOut: 0 }));
+  const lines = d.lines.map(([m, name, colour, km, ms, built, bsrc], i) => ({ i, m, name, colour, km, ms: ms || 0, built: built || '', bsrc: bsrc || '', pIn: null, pOut: null, sIn: [], sOut: [], nIn: 0, nOut: 0 }));
+  // each rail segment is cut into pieces (shared by the lines that use it); a line's whole path is the join of its pieces (see chunkInto)
   for (const [ids, inside, l] of d.rail) {
-    const pts = decode(l, u);
-    for (const id of ids) { const L = lines[id]; addLine(inside ? L.pIn : L.pOut, pts, false); inside ? L.nIn++ : L.nOut++; }
+    const pieces = [];
+    chunkInto(pieces, decode(l, u), false);
+    for (const id of ids) {
+      const L = lines[id];
+      if (inside) { L.nIn++; L.sIn.push(...pieces); } else { L.nOut++; L.sOut.push(...pieces); }
+    }
   }
+  for (const L of lines) { L.pIn = joinPieces(L.sIn); L.pOut = joinPieces(L.sOut); }
   const modesPresent = new Set(lines.filter(L => L.nIn).map(L => L.m));
   // rank: 0 single-line stop, 1 interchange (2-3 lines), 2 major interchange (4+, set per region), 3 high-speed stop, 4 main high-speed station, 5 main station
   const stations = (d.stations || []).map(([x, y, n, loc, k, inside, sl, tier, nl, sd]) => {
@@ -409,7 +456,7 @@ function prepare(d) {
     return { x: x * u, y: y * u, n, loc, k, inside, lines: sl || [], tier: tier || 0, nl, rank, sd: sd || '', tramlike: k === 2 && rank <= 1 && (sl || []).length > 0 && (sl || []).every(li => [2, 3, 5].includes(lines[li].m)) };
   });
   stations.sort((p, q) => p.rank - q.rank || q.nl - p.nl);
-  return { d, land, legal, divs, roads, lines, modesPresent, stations,
+  return { d, land, legal, divs, roads, landC: { whole: joinPieces(landP), pieces: landP }, lines, modesPresent, stations,
     bounds: [minx, miny, maxx, maxy], centroid: [d.centroid[0] * u, d.centroid[1] * u],
     labels: (d.div_names || []).map(([x, y, n, a]) => ({ x: x * u, y: y * u, n, a })) };
 }
@@ -434,7 +481,7 @@ async function ensureRoads(c) {
     const r = await fetch('data/' + c.d.roads_file);
     if (!r.ok) throw new Error('roads');
     const j = await r.json();
-    c.roads = j.roads.map(cls => { const p = new Path2D(); for (const l of cls) addLine(p, decode(l, j.unit), false); return p; });
+    c.roads = j.roads.map(cls => culledLines(cls, j.unit));
     c.d.roads = j.roads;
     if (typeof buildTable === 'function') buildTable(visibleItems());
     draw();
@@ -466,7 +513,7 @@ function resize() {
   const r = canvas.getBoundingClientRect();
   DPR = Math.min(window.devicePixelRatio || 1, 2.5);
   W = r.width; H = r.height;
-  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  canvas.width = over.width = Math.round(W * DPR); canvas.height = over.height = Math.round(H * DPR);
   draw();
 }
 
@@ -558,15 +605,56 @@ function drawHandle(it) {
   ctx.beginPath(); ctx.arc(k.x, k.y, 2.4, 0, Math.PI * 2); ctx.fillStyle = colors.map; ctx.fill();
 }
 
-let raf = 0;
-function draw() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; render(); }); }
+// Two layers: the map (#map: land, roads, outlines, rail, station outlines) and the overlay (#over: hovered line, station dots, labels,
+// anchors, rotation ring), which is cheap and redrawn every frame. The map is redrawn only when the view or the map content changed, so
+// hovering a line does not redraw the whole map.
+//   draw()      something on the map changed: redraw both layers
+//   draw(true)  only overlay things changed (hover, rotation ring state); a moved view still redraws the map
+// (Shifting the map image during a pan and drawing only the new strips was tried: on the GPU it was slower than a full culled redraw.)
+let raf = 0, baseDirty = true, baseView = null;
+function draw(keepBase) {
+  if (!keepBase) baseDirty = true;
+  if (!raf) raf = requestAnimationFrame(frame);
+}
+function frame() {
+  raf = 0;
+  const v = state.view, b = baseView;
+  if (baseDirty || !b || b.cx !== v.cx || b.cy !== v.cy || b.s !== v.s || b.r !== v.r || b.W !== W || b.H !== H || b.DPR !== DPR) {
+    renderBase();
+    baseView = { cx: v.cx, cy: v.cy, s: v.s, r: v.r, W, H, DPR }; baseDirty = false;
+  }
+  renderOverlay();
+}
 
-function render() {
+// The screen rectangle (plus margin px) in a city's local coordinates: the inverse of the transform setT sets, as an axis-aligned box.
+function localView(off, margin, rect = [0, 0, W, H]) {
+  const { s, cx, cy, r } = state.view;
+  const co = Math.cos(r), si = Math.sin(r), ex = off.x - cx, ey = off.y - cy;
+  const p = off.r || 0, cp = Math.cos(p), sp = Math.sin(p);
+  const a = s * (cp * co + sp * si), b = s * (cp * si - sp * co), c = s * (-sp * co + cp * si), d = s * (-sp * si - cp * co);
+  const e = W / 2 + s * (ex * co + ey * si), f = H / 2 + s * (ex * si - ey * co), det = a * d - b * c;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const [X0, Y0, X1, Y1] = rect;
+  for (const [X, Y] of [[X0 - margin, Y0 - margin], [X1 + margin, Y0 - margin], [X0 - margin, Y1 + margin], [X1 + margin, Y1 + margin]]) {
+    const x = (d * (X - e) - c * (Y - f)) / det, y = (-b * (X - e) + a * (Y - f)) / det;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  return [x0, y0, x1, y1];
+}
+// The path to stroke for a line: the whole path when most of it is on screen, else only the segments that touch the viewport (null if none).
+function railPath(L, inside, vp) {
+  return pickPieces(inside ? L.sIn : L.sOut, inside ? L.pIn : L.pOut, vp);
+}
+
+function renderBase() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  try { drawBase(); } finally { ctx.restore(); ctx.setTransform(1, 0, 0, 1, 0, 0); }
+}
+function drawBase() {
   const items = visibleItems();
-  if (!items.length) { document.getElementById('scalebar').style.visibility = 'hidden'; return; }
-  document.getElementById('scalebar').style.visibility = '';
+  if (!items.length) return;
   const s = state.view.s;
   const fillA = colors.dark ? 0.2 : 0.16;
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
@@ -582,33 +670,37 @@ function render() {
     for (const it of items) ensureRoads(it.c);
     for (const it of items) {
       setT(it.off);
+      const vp = localView(it.off, 40);
       for (let k = 3; k >= 0; k--) {
         if (s < ROAD_MIN_SCALE[k]) continue;
         ctx.strokeStyle = alpha(it.col, (k === 0 ? 0.55 : k === 1 ? 0.45 : 0.34) * (it.dim ? 0.5 : 1));
         ctx.lineWidth = ROAD_W[k] / s;
         ctx.setLineDash([]);
-        ctx.stroke(it.c.roads[k]);
+        const rp = cullPath(it.c.roads[k], vp);
+        if (rp) ctx.stroke(rp);
       }
     }
   }
   // 3. outlines (legal limit incl. water is dashed and faint)
   for (const it of items) {
     setT(it.off);
+    const vp = localView(it.off, 40), lp = cullPath(it.c.legal, vp), dp = cullPath(it.c.divs, vp), np = cullPath(it.c.landC, vp);
     ctx.setLineDash([4 / s, 4 / s]);
     ctx.strokeStyle = alpha(it.col, 0.45); ctx.lineWidth = 1 / s;
-    ctx.stroke(it.c.legal);
+    if (lp) ctx.stroke(lp);
     ctx.setLineDash([1.5 / s, 3 / s]);
     ctx.strokeStyle = alpha(it.col, 0.55); ctx.lineWidth = 0.8 / s;
-    ctx.stroke(it.c.divs);
+    if (dp) ctx.stroke(dp);
     ctx.setLineDash([]);
     ctx.strokeStyle = it.dim ? alpha(it.col, 0.5) : it.col; ctx.lineWidth = (it.sel ? 2.8 : 1.8) / s;
-    ctx.stroke(it.c.land);
+    if (np) ctx.stroke(np);
   }
   // 4. rail: official colour inside a casing in the city's colour, so the two cities stay distinguishable
   const railScale = Math.max(0.8, Math.min(1.5, Math.sqrt(s / 0.02)));
   if (state.layer >= 1) {
     for (const it of items) {
       setT(it.off);
+      const vp = localView(it.off, 60);
       const hid = hiddenSet(it.c.d.id);
       const vis = it.c.lines.filter(L => !hid.has(L.i))
         .sort((p, q) => MODE_ORDER.indexOf(p.m) - MODE_ORDER.indexOf(q.m));
@@ -618,7 +710,8 @@ function render() {
         for (const pass of [0, 1]) {
           for (const L of vis) {
             if (inside ? !L.nIn : !L.nOut) continue;
-            const p = inside ? L.pIn : L.pOut;
+            const p = railPath(L, inside, vp);
+            if (!p) continue;
             ctx.globalAlpha = baseA * (L.m === 6 || L.m === 10 ? 1 : 0.6);   // everything except high-speed rail is drawn at 60% opacity
             const M = MODES[L.m];
             const w = M.w * railScale;
@@ -640,27 +733,8 @@ function render() {
     }
     ctx.setLineDash([]);
   }
-  // 4a. hovered line: halo + redraw on top
-  if (state.layer >= 1 && state.hover) {
-    const it = items.find(x => x.c === state.hover.it.c);
-    if (it) {
-      setT(it.off);
-      for (const L of state.hover.hits) {
-        const M = MODES[L.m], w = M.w * railScale;
-        for (const p of [L.pIn, ...(state.context ? [L.pOut] : [])]) {
-          ctx.setLineDash([]);
-          ctx.strokeStyle = alpha(colors.ink, 0.28) || colors.ink; ctx.lineWidth = (w + 8) / s; ctx.stroke(p);
-          ctx.strokeStyle = lineColor(L.colour, L.m);
-          ctx.lineWidth = (w + 1.5) / s;
-          ctx.setLineDash(M.dash ? M.dash.map(v => v * railScale / s) : []);
-          ctx.stroke(p);
-        }
-      }
-      ctx.setLineDash([]);
-    }
-  }
-  // 4b. stations: only those served by a visible line; high-speed stops and big interchanges get larger marks
-  if (state.layer >= 1 && state.stations && s >= CFG.stations.outlineMinScale) {      // station outlines (footprints), once zoomed in
+  // 4b. station outlines (footprints), once zoomed in
+  if (state.layer >= 1 && state.stations && s >= CFG.stations.outlineMinScale) {
     for (const it of items) {
       const sd = it.c.sd; if (!sd) continue;
       if (!sd.fp) buildFootprints(sd);
@@ -675,8 +749,44 @@ function render() {
       }
       ctx.globalAlpha = 1;
     }
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
+}
+// the overlay: hovered line, stations, labels, anchors, rotation ring; drawn with the shared helpers by pointing ctx at the overlay
+function renderOverlay() {
+  ctx = overCtx;
+  try { drawOverlay(); } finally { ctx = baseCtx; }
+}
+function drawOverlay() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, over.width, over.height);
+  const items = visibleItems();
+  if (!items.length) { document.getElementById('scalebar').style.visibility = 'hidden'; return; }
+  document.getElementById('scalebar').style.visibility = '';
+  const s = state.view.s;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  const railScale = Math.max(0.8, Math.min(1.5, Math.sqrt(s / 0.02)));
+  // 4a. hovered line: halo + redraw on top
+  if (state.layer >= 1 && state.hover) {
+    const it = items.find(x => x.c === state.hover.it.c);
+    if (it) {
+      setT(it.off);
+      const vp = localView(it.off, 60);
+      for (const L of state.hover.hits) {
+        const M = MODES[L.m], w = M.w * railScale;
+        for (const p of [railPath(L, true, vp), ...(state.context ? [railPath(L, false, vp)] : [])]) {
+          if (!p) continue;
+          ctx.setLineDash([]);
+          ctx.strokeStyle = alpha(colors.ink, 0.28) || colors.ink; ctx.lineWidth = (w + 8) / s; ctx.stroke(p);
+          ctx.strokeStyle = lineColor(L.colour, L.m);
+          ctx.lineWidth = (w + 1.5) / s;
+          ctx.setLineDash(M.dash ? M.dash.map(v => v * railScale / s) : []);
+          ctx.stroke(p);
+        }
+      }
+      ctx.setLineDash([]);
+    }
+  }
+  // 4c. stations: only those served by a visible line; high-speed stops and big interchanges get larger marks
   const labelQueue = [];
   hitList = [];
   if (state.layer >= 1 && state.stations) {
@@ -1501,13 +1611,13 @@ function linesAt(px, py) {
   for (let k = items.length - 1; k >= 0; k--) {
     const it = items[k];
     setT(it.off);
-    ctx.lineWidth = 10 / state.view.s;
-    const hid = hiddenSet(it.c.d.id);
+    ctx.lineWidth = 10 / state.view.s; ctx.setLineDash([]);
+    const hid = hiddenSet(it.c.d.id), vp = localView(it.off, 8, [px, py, px, py]);   // only the pieces near the pointer are tested
+    const near = (L, inside) => { const p = (inside ? L.nIn : L.nOut) && railPath(L, inside, vp); return p && ctx.isPointInStroke(p, px * DPR, py * DPR); };
     const hits = [];
     for (const L of it.c.lines) {
       if (hid.has(L.i)) continue;
-      if ((L.nIn && ctx.isPointInStroke(L.pIn, px * DPR, py * DPR)) ||
-          (state.context && L.nOut && ctx.isPointInStroke(L.pOut, px * DPR, py * DPR))) hits.push(L);
+      if (near(L, true) || (state.context && near(L, false))) hits.push(L);
     }
     if (hits.length) { ctx.setTransform(1, 0, 0, 1, 0, 0); return { it, hits }; }
   }
@@ -1517,7 +1627,7 @@ function linesAt(px, py) {
 function setHover(h) {
   const key = h ? h.it.c.d.id + ':' + h.hits.map(L => L.i).join(',') : '';
   if (key === (state.hoverKey || '')) return;
-  state.hoverKey = key; state.hover = h; draw();
+  state.hoverKey = key; state.hover = h; draw(true);
 }
 function lineTip(px, py) {
   const h = linesAt(px, py);
@@ -1570,7 +1680,7 @@ canvas.addEventListener('pointerup', e => {
 function up(e) {
   ptrs.delete(e.pointerId);
   if (ptrs.size < 2) pinch = null;
-  if (!ptrs.size) { drag = null; state.snapDeg = null; canvas.classList.remove('dragging'); draw(); }
+  if (!ptrs.size) { drag = null; state.snapDeg = null; canvas.classList.remove('dragging'); draw(true); }
   else if (ptrs.size === 1) drag = null;
 }
 canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
