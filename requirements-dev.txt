@@ -1,0 +1,2 @@
+-r requirements.txt
+playwright   # for tests/smoke.py; the test drives the Chrome you have installed

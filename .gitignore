@@ -1,0 +1,17 @@
+# macOS / Python
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# generated, regenerable from the planet (see README)
+run2/
+pipeline/qa/
+site/data/.index.lock
+
+# raw OSM extracts
+*.osm.pbf
+
+# Rust build output
+extract/target/

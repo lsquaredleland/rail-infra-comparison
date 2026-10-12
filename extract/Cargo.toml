@@ -1,0 +1,18 @@
+[package]
+name = "ra-extract"
+version = "0.1.0"
+edition = "2021"
+description = "Extract rail, stations, roads, coast and boundaries for every region group from an OSM planet PBF in one set of parallel passes"
+license = "MIT"
+
+[dependencies]
+rayon = "1"            # parallel blob decoding
+libdeflater = "1"      # fastest zlib decompression into a pre-sized buffer
+rustc-hash = "2"       # fast hash maps for id lookups
+serde_json = "1"       # reading groups.json and merging bnd_rels.json
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
