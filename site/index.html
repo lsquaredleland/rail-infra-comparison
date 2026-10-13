@@ -136,7 +136,7 @@ table.cmp td.txt { font-variant-numeric: normal; font-size: 12.5px; }
 .mapwrap { position: relative; min-width: 0; background: var(--map); overflow: hidden; order: 1; }
 canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 canvas.dragging { cursor: grabbing; }
-#over { position: absolute; inset: 0; pointer-events: none; }
+#over, #gl { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .hud { position: absolute; left: 14px; bottom: 14px; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
 .scalebar { background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px 5px; font: 600 12px var(--font-display); letter-spacing: 0.03em; font-variant-numeric: tabular-nums; }
 .scalebar .bar { height: 5px; border: 1.5px solid var(--ink); border-top: 0; margin-top: 3px; }
@@ -208,6 +208,7 @@ canvas.dragging { cursor: grabbing; }
 <div class="app">
   <div class="mapwrap" id="mapwrap">
     <canvas id="map" tabindex="0" aria-label="Overlay map of the selected cities at the same scale. Tab selects a city, Q and E rotate it, R resets, Escape deselects."></canvas>
+    <canvas id="gl" aria-hidden="true" hidden></canvas>
     <canvas id="over" aria-hidden="true"></canvas>
     <div class="loading" id="loading">Loading map data</div>
     <div class="tip" id="tip" hidden></div>
@@ -268,6 +269,14 @@ canvas.dragging { cursor: grabbing; }
       <div class="seg" role="group" aria-label="Alignment">
         <button data-align="anchor" aria-pressed="true">Downtown</button>
         <button data-align="centroid" aria-pressed="false">Center of area</button>
+      </div>
+    </section>
+
+    <section>
+      <p class="label">Drawing</p>
+      <div class="seg" role="group" aria-label="Drawing mode">
+        <button data-renderer="canvas" aria-pressed="true" title="2D canvas (default)">Canvas</button>
+        <button data-renderer="gl" aria-pressed="false" title="deck.gl on the GPU, for comparison; loads about 0.26 MB the first time">WebGL</button>
       </div>
     </section>
 
@@ -355,7 +364,7 @@ const ROAD_MIN_SCALE = [0, 0.006, 0.014, 0.03]; // px per meter needed before a 
 
 const MAX_SLOTS = 4;
 const state = { slots: [{ id: 'sf', ci: 0, off: { x: 0, y: 0 } }, { id: 'tky23', ci: 1, off: { x: 0, y: 0 } }],
-  layer: 1, align: 'anchor', official: true, context: true, stations: true, unit: 'mi',
+  layer: 1, align: 'anchor', renderer: 'canvas', official: true, context: true, stations: true, unit: 'mi',
   modeOff: new Set(), hidden: {}, tab: 0, filter: '', sel: null, snapDeg: null,
   view: { cx: 0, cy: 0, s: 0.02, r: 0 } };
 const cache = {};
@@ -482,7 +491,7 @@ async function ensureRoads(c) {
     if (!r.ok) throw new Error('roads');
     const j = await r.json();
     c.roads = j.roads.map(cls => culledLines(cls, j.unit));
-    c.d.roads = j.roads;
+    c.d.roads = j.roads; c.roadsUnit = j.unit;
     if (typeof buildTable === 'function') buildTable(visibleItems());
     draw();
   } catch (e) { c.roadsLoaded = false; }
@@ -514,6 +523,7 @@ function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2.5);
   W = r.width; H = r.height;
   canvas.width = over.width = Math.round(W * DPR); canvas.height = over.height = Math.round(H * DPR);
+  if (glDeck) glDeck.setProps({ useDevicePixels: DPR });
   draw();
 }
 
@@ -611,6 +621,206 @@ function drawHandle(it) {
 //   draw()      something on the map changed: redraw both layers
 //   draw(true)  only overlay things changed (hover, rotation ring state); a moved view still redraws the map
 // (Shifting the map image during a pan and drawing only the new strips was tried: on the GPU it was slower than a full culled redraw.)
+// ================= optional WebGL drawing of the map (deck.gl) =================
+// "Drawing: WebGL" draws the base map (land, roads, outlines, rail, station outlines) with deck.gl on #gl instead of the 2D canvas #map;
+// the overlay (#over: hovered line, stations, labels, rotation ring) and hover are the same in both modes. deck.gl (site/vendor) loads
+// the first time WebGL is chosen, and each region's GPU geometry is built the first time it is drawn that way. Measured on an M4 Max,
+// WebGL is no faster than the culled canvas (both 120 fps) and zooms slower with the CPU slowed 4x; the switch is there to compare
+// on other devices. Details (dashes, depth, pitfalls): CLAUDE.md.
+// The view is a plain pixel space (OrthographicView, zoom 0, y down): each city's model matrix is setT's affine transform.
+let GLC, DASH, glDeck = null, glFailed = false, glLoading = null;
+function initGL() {
+  GLC = deck.COORDINATE_SYSTEM.CARTESIAN; DASH = new deck.PathStyleExtension({ dash: true });
+  try {
+    glDeck = new deck.Deck({
+      canvas: 'gl', views: new deck.OrthographicView({ id: 'o', flipY: true }), viewState: { target: [W / 2, H / 2, 0], zoom: 0 },
+      controller: false, useDevicePixels: DPR, layers: [],
+      parameters: { depthWriteEnabled: true, depthCompare: 'less' },   // see buildLayers: each stroke blends once, like a canvas stroke
+      onLoad: () => { state.renderer = 'gl'; document.getElementById('gl').hidden = false; draw(); },
+      onError: e => { console.error(e); glFailed = true; showGLError(); },
+    });
+  } catch (e) { console.error(e); glFailed = true; showGLError(); }
+}
+function showGLError() {     // no WebGL here: stay on the canvas
+  setRenderer('canvas'); live('WebGL is not available in this browser; the map stays on the canvas');
+}
+const rgbCache = new Map();
+function rgba(col, a = 1) {      // '#rrggbb' or '#rgb' (or rgb()/rgba()) -> [r, g, b, a 0-255]
+  let c = rgbCache.get(col);
+  if (!c) {
+    let m;
+    if (col && col[0] === '#') { let h = col.slice(1); if (h.length === 3) h = h.split('').map(x => x + x).join(''); const n = parseInt(h.slice(0, 6), 16); c = [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+    else if (col && (m = col.match(/rgba?\(([^)]+)\)/))) c = m[1].split(',').slice(0, 3).map(v => +v);
+    else c = [128, 128, 128];
+    rgbCache.set(col, c);
+  }
+  return [c[0], c[1], c[2], Math.round(255 * Math.max(0, Math.min(1, a)))];
+}
+function modelMatrix(off) {      // the transform of setT without the device pixel ratio, as a column-major 4x4 matrix
+  const { s, cx, cy, r } = state.view;
+  const co = Math.cos(r), si = Math.sin(r), ex = off.x - cx, ey = off.y - cy;
+  const p = off.r || 0, cp = Math.cos(p), sp = Math.sin(p);
+  return [s * (cp * co + sp * si), s * (cp * si - sp * co), 0, 0,
+    s * (-sp * co + cp * si), s * (-sp * si - cp * co), 0, 0,
+    0, 0, 1, 0,
+    W / 2 + s * (ex * co + ey * si), H / 2 + s * (ex * si - ey * co), 0, 1];
+}
+const flat = o => o;
+const railScaleOf = s => Math.max(0.8, Math.min(1.5, Math.sqrt(s / 0.02)));
+const modeAlpha = m => m === 6 || m === 10 ? 1 : 0.6;    // everything except high-speed rail is drawn at 60% opacity
+// GPU geometry of a region, built from its raw data the first time it is drawn with WebGL (roads again once their file has loaded)
+function glGeom(c) {
+  let g = c.gl;
+  if (!g) {
+    const d = c.d, u = d.unit;
+    g = c.gl = { landPolys: [], landRings: [] };
+    for (const poly of d.land) {
+      const rings = poly.map(r => decode(r, u)).filter(r => r.length >= 6);
+      if (!rings.length) continue;
+      const positions = new Float32Array(rings.reduce((t, r) => t + r.length, 0)), holeIndices = [];
+      let o = 0;
+      rings.forEach((pts, k) => { if (k) holeIndices.push(o); positions.set(pts, o); o += pts.length; g.landRings.push(pts); });
+      g.landPolys.push({ positions, holeIndices });     // holeIndices index the flat coordinate array, not vertices
+    }
+    g.legal = d.legal.flat().map(r => decode(r, u)).filter(r => r.length >= 4);
+    g.divs = (d.divs || []).map(l => decode(l, u)).filter(r => r.length >= 4);
+    // rail points carry a z: the line's depth within its layer (see buildLayers), from its rank in draw order (MODE_ORDER, then index)
+    const order = c.lines.slice().sort((p, q) => MODE_ORDER.indexOf(p.m) - MODE_ORDER.indexOf(q.m) || p.i - q.i), rank = [];
+    order.forEach((L, k) => { rank[L.i] = k; });
+    g.rail = c.lines.map(() => [[], []]);       // per line: [outside, inside]
+    for (const [ids, inside, l] of d.rail) {
+      const pts = decode(l, u);
+      if (pts.length < 4) continue;
+      for (const id of ids) {
+        const z = (rank[id] + 1) / (c.lines.length + 1), xyz = new Float32Array(pts.length / 2 * 3);
+        for (let i = 0, j = 0; i < pts.length; i += 2, j += 3) { xyz[j] = pts[i]; xyz[j + 1] = pts[i + 1]; xyz[j + 2] = z; }
+        g.rail[id][inside ? 1 : 0].push(xyz);
+      }
+    }
+  }
+  if (g.roadsFor !== c.d.roads) { const u = c.roadsUnit || c.d.unit; g.roads = c.d.roads.map(cls => cls.map(l => decode(l, u))); g.roadsFor = c.d.roads; }
+  return g;
+}
+// Rail data of a city: per inside/outside, the casing paths and the solid and dashed line paths, in draw order (MODE_ORDER, then line
+// index); rebuilt only when its visible lines change (deck.gl then re-uploads just those layers). Three layers per side instead of one per
+// mode and pass: deck.gl costs about 0.2 ms of CPU per layer per frame, which mattered on slow CPUs.
+function railGroups(c) {
+  const hid = hiddenSet(c.d.id), key = [...hid].sort((a, b) => a - b).join(',');
+  if (c.railKey === key) return c.railData;
+  const g = [0, 1].map(() => ({ casing: [], solid: [], dashed: [] }));
+  const vis = c.lines.filter(L => !hid.has(L.i)).sort((p, q) => MODE_ORDER.indexOf(p.m) - MODE_ORDER.indexOf(q.m) || p.i - q.i);
+  const R = glGeom(c).rail;
+  for (const L of vis) for (const [inside, list] of [[1, R[L.i][1]], [0, R[L.i][0]]]) for (const p of list) {
+    const o = { p, L };
+    if (L.m !== 7 && L.m !== 9) g[inside].casing.push(o);
+    g[inside][MODES[L.m].dash ? 'dashed' : 'solid'].push(o);
+  }
+  c.railKey = key; c.railData = g;
+  return g;
+}
+function footprintData(sd) {
+  if (sd.glfp) return sd.glfp;
+  const f = { built: [], planned: [] };
+  for (const rec of sd.stations) {
+    const d = sd.detail[rec.id]; if (!d || !d.footprint) continue;
+    for (const ring of d.footprint) if (ring.length >= 3) f[rec.status === 'built' ? 'built' : 'planned'].push(new Float32Array(ring.flat()));
+  }
+  return sd.glfp = f;
+}
+function pathLayer(id, data, mm, props) {
+  return new deck.PathLayer(Object.assign({ id, data, getPath: flat, positionFormat: 'XY', coordinateSystem: GLC, modelMatrix: mm,
+    widthUnits: 'pixels', capRounded: true, jointRounded: true, _pathType: 'open' }, props));
+}
+// Dashes. deck.gl's dash extension measures dashes in half line widths, and needs flat caps (with capRounded it draws the line solid).
+// The 2D canvas used round caps, which lengthen each dash by up to one line width; on average they cover about 3/4 of the width, so a
+// pattern of dash d and gap g pixels at width w becomes [(d + 0.75 w), (g - 0.75 w)] / (w / 2) with flat caps.
+function dashUnits(d, g, w) { return [(d + 0.75 * w) / (w / 2), Math.max(g - 0.75 * w, 0.5) / (w / 2)]; }
+function dashed(d, g, w) { return { extensions: [DASH], getDashArray: dashUnits(d, g, w), dashJustified: false, capRounded: false }; }
+// Draw order and blending. A 2D canvas stroke blends once even where the path overlaps itself (a line's two parallel tracks at low zoom,
+// road junctions); deck.gl draws every path separately, so overlaps would darken. The depth buffer restores the canvas behaviour: each
+// layer gets its own depth, nearer than every layer before it (z from about -1000 up to 0 is kept, nearer is closer to 0), and with
+// depthCompare 'less' a pixel already drawn at that depth is not blended again. Rail points carry a fraction of a step of their own
+// (one per line), so two lines still blend over each other while one line's own overlaps do not.
+const ZSTEP = 3, ZFAR = -950;   // depth per layer, counting up from ZFAR: up to about 300 layers fit
+function buildLayers(items) {
+  const s = state.view.s, rs = railScaleOf(s), out = [], fillA = colors.dark ? 0.2 : 0.16;
+  const base = items.map(it => modelMatrix(it.off)), pre = it => `c${it.i}-${it.c.d.id}`, geo = items.map(it => glGeom(it.c));
+  // model matrix of city k for the layer about to be pushed: its depth is one step nearer than the last layer's (same: the same depth)
+  let zi = 0;
+  const mm = (k, same) => { if (!same) zi++; const m = base[k].slice(); m[10] = ZSTEP; m[14] = ZFAR + zi * ZSTEP; return m; };
+  // 1. land fills
+  items.forEach((it, k) => out.push(new deck.SolidPolygonLayer({ id: pre(it) + '-land', data: geo[k].landPolys, getPolygon: flat, positionFormat: 'XY',
+    coordinateSystem: GLC, modelMatrix: mm(k), getFillColor: rgba(it.col, fillA * (it.dim ? 0.6 : 1)) })));
+  // 2. streets
+  if (state.layer >= 2) {
+    for (const it of items) ensureRoads(it.c);
+    items.forEach((it, k) => {
+      if (!geo[k].roads.some(r => r.length)) return;
+      for (let q = 3; q >= 0; q--) out.push(pathLayer(`${pre(it)}-road${q}`, geo[k].roads[q], mm(k), { visible: s >= ROAD_MIN_SCALE[q],
+        getColor: rgba(it.col, (q === 0 ? 0.55 : q === 1 ? 0.45 : 0.34) * (it.dim ? 0.5 : 1)), getWidth: ROAD_W[q] }));
+    });
+  }
+  // 3. outlines: legal limit (incl. water) dashed and faint, division lines dotted, land edge solid
+  items.forEach((it, k) => {
+    out.push(pathLayer(pre(it) + '-legal', geo[k].legal, mm(k), { _pathType: 'loop', getColor: rgba(it.col, 0.45), getWidth: 1, ...dashed(4, 4, 1) }));
+    out.push(pathLayer(pre(it) + '-divs', geo[k].divs, mm(k), { getColor: rgba(it.col, 0.55), getWidth: 0.8, ...dashed(1.5, 3, 0.8) }));
+    out.push(pathLayer(pre(it) + '-edge', geo[k].landRings, mm(k), { _pathType: 'loop', getColor: rgba(it.col, it.dim ? 0.5 : 1), getWidth: it.sel ? 2.8 : 1.8 }));
+  });
+  // 4. rail: official colour inside a casing in the city's colour, so the cities stay distinguishable; outside the limits faded.
+  // Zoom changes widths only through widthScale (a uniform), so no width data is rebuilt while zooming. The casing is therefore
+  // (w + 2.6) x rs rather than w x rs + 2.6: its edge is 1.04 px a side zoomed out and 1.95 px zoomed in, instead of always 1.3 px.
+  if (state.layer >= 1) items.forEach((it, k) => {
+    const g = railGroups(it.c), col = it.col;
+    for (const inside of [0, 1]) {
+      if (!inside && !state.context) continue;
+      const baseA = (inside ? 1 : 0.32) * (it.dim ? 0.5 : 1), G = g[inside], id = `${pre(it)}-r${inside}`;
+      const lineCol = o => { const a = baseA * modeAlpha(o.L.m); return o.L.m === 7 ? rgba(col, 0.75 * a) : rgba(lineColor(o.L.colour, o.L.m), a); };
+      const trig = { getColor: [col, baseA, state.official, colors.dark] };
+      out.push(pathLayer(id + 'c', G.casing, mm(k), { getPath: o => o.p, positionFormat: 'XYZ', updateTriggers: trig, widthScale: rs,
+        getColor: o => rgba(col, baseA * modeAlpha(o.L.m)), getWidth: o => MODES[o.L.m].w + 2.6 }));
+      // solid and dashed lines share one depth step, so their per-line depths keep MODE_ORDER between the two layers
+      out.push(pathLayer(id + 's', G.solid, mm(k), { getPath: o => o.p, positionFormat: 'XYZ', updateTriggers: trig, widthScale: rs,
+        getColor: lineCol, getWidth: o => MODES[o.L.m].w }));
+      out.push(pathLayer(id + 'd', G.dashed, mm(k, true), { getPath: o => o.p, positionFormat: 'XYZ', updateTriggers: trig, widthScale: rs,
+        getColor: lineCol, getWidth: o => MODES[o.L.m].w,
+        extensions: [DASH], dashJustified: false, capRounded: false, getDashArray: o => { const M = MODES[o.L.m]; return dashUnits(M.dash[0], M.dash[1], M.w); } }));
+    }
+  });
+  // 4b. station outlines (footprints), once zoomed in
+  if (state.layer >= 1 && state.stations && s >= CFG.stations.outlineMinScale) items.forEach((it, k) => {
+    const sd = it.c.sd; if (!sd) return;
+    const f = footprintData(sd), da = it.dim ? 0.55 : 1;
+    const parts = [['built', colors.dark ? 0.28 : 0.2, null]];
+    if (!state.modeOff.has(8)) parts.push(['planned', 0.1, [5, 3.5]]);
+    for (const [kind, fa, dash] of parts) {
+      out.push(new deck.SolidPolygonLayer({ id: `${pre(it)}-fp${kind}`, data: f[kind], getPolygon: flat, positionFormat: 'XY', coordinateSystem: GLC, modelMatrix: mm(k),
+        getFillColor: rgba(it.col, fa * da) }));
+      out.push(pathLayer(`${pre(it)}-fpl${kind}`, f[kind], mm(k), { _pathType: 'loop', getColor: rgba(it.col, da), getWidth: 1.9, ...(dash ? dashed(dash[0], dash[1], 1.9) : {}) }));
+    }
+  });
+  return out;
+}
+function renderGL(items) {
+  if (!glDeck || glFailed) return;
+  glDeck.setProps({ viewState: { target: [W / 2, H / 2, 0], zoom: 0 }, layers: buildLayers(items) });
+  glDeck.redraw('frame');     // synchronous, so the map never lags the overlay during a pan
+}
+// switch drawing mode; WebGL loads deck.gl first (scripts in order), the canvas is used until it is ready
+function loadScript(src) { return new Promise((ok, fail) => { const e = document.createElement('script'); e.src = src; e.onload = ok; e.onerror = fail; document.head.appendChild(e); }); }
+async function setRenderer(mode) {
+  document.querySelectorAll('[data-renderer]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.renderer === mode)));
+  const url = new URL(location.href);
+  mode === 'gl' ? url.searchParams.set('renderer', 'webgl') : url.searchParams.delete('renderer');
+  history.replaceState(null, '', url);
+  if (mode === 'canvas') { state.renderer = 'canvas'; document.getElementById('gl').hidden = true; draw(); return; }
+  if (glDeck) { if (!glFailed) { state.renderer = 'gl'; document.getElementById('gl').hidden = false; draw(); } return; }
+  try {
+    glLoading ||= (async () => { for (const f of ['core', 'layers', 'extensions']) await loadScript(`vendor/deck.gl-9.3.11/${f}.min.js`); })();
+    await glLoading;
+    if (!glDeck) { document.getElementById('gl').hidden = false; initGL(); }   // shown first so it has a size; its onLoad switches state.renderer to 'gl'
+  } catch (e) { console.error(e); glLoading = null; showGLError(); }
+}
+
 let raf = 0, baseDirty = true, baseView = null;
 function draw(keepBase) {
   if (!keepBase) baseDirty = true;
@@ -620,7 +830,10 @@ function frame() {
   raf = 0;
   const v = state.view, b = baseView;
   if (baseDirty || !b || b.cx !== v.cx || b.cy !== v.cy || b.s !== v.s || b.r !== v.r || b.W !== W || b.H !== H || b.DPR !== DPR) {
-    renderBase();
+    if (state.renderer === 'gl') {     // WebGL mode: the 2D map canvas stays empty, deck.gl draws the map on #gl
+      baseCtx.setTransform(1, 0, 0, 1, 0, 0); baseCtx.clearRect(0, 0, canvas.width, canvas.height);
+      renderGL(visibleItems());
+    } else renderBase();
     baseView = { cx: v.cx, cy: v.cy, s: v.s, r: v.r, W, H, DPR }; baseDirty = false;
   }
   renderOverlay();
@@ -1146,6 +1359,7 @@ function segGroup(attr, fn) {
 segGroup('layer', v => { state.layer = +v; draw(); });
 segGroup('align', v => { state.align = v; state.slots.forEach(sl => { sl.off = { x: 0, y: 0 }; sl.rot = 0; }); syncRot(); fit(); });
 segGroup('unit', v => { state.unit = v; buildTable(visibleItems()); });
+segGroup('renderer', v => setRenderer(v));
 function setLineColors(on) {
   state.official = on;
   document.getElementById('official').checked = on;
@@ -1698,4 +1912,5 @@ new MutationObserver(onTheme).observe(document.documentElement, { attributes: tr
 readColors();
 resize();
 refresh();
+if (new URLSearchParams(location.search).get('renderer') === 'webgl') setRenderer('gl');
 </script>
