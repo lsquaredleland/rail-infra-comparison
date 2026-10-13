@@ -760,8 +760,9 @@ function drawOverlay() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, over.width, over.height);
   const items = visibleItems();
-  if (!items.length) { document.getElementById('scalebar').style.visibility = 'hidden'; return; }
-  document.getElementById('scalebar').style.visibility = '';
+  const sb = document.getElementById('scalebar').style, vis = items.length ? '' : 'hidden';
+  if (sb.visibility !== vis) sb.visibility = vis;
+  if (!items.length) return;
   const s = state.view.s;
   ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   const railScale = Math.max(0.8, Math.min(1.5, Math.sqrt(s / 0.02)));
@@ -913,16 +914,21 @@ function normColor(c) {
   return CSS_NAMES[c] || '';
 }
 
+// The scale bar is DOM: writing its text or width forces a style and layout pass, which cost more than drawing the whole frame on a
+// slow CPU (77 fps against 120 with the CPU slowed 4x). So it is written only when it changes: never while panning.
+let scaleShown = { px: -1, txt: '' };
 function updateScale() {
   const s = state.view.s; // px per meter
   const target = 110 / s; // meters for ~110px
   const steps = [50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000, 50000, 100000, 200000];
   let m = steps[0]; for (const v of steps) if (v <= target) m = v;
-  const px = m * s;
-  document.getElementById('scalebarline').style.width = px + 'px';
+  const px = Math.round(m * s * 2) / 2;
   const km = m >= 1000 ? (m / 1000) + ' km' : m + ' m';
   const mi = m / 1609.344;
-  document.getElementById('scaletxt').textContent = km + '  (' + (mi >= 1 ? mi.toFixed(mi < 10 ? 1 : 0) + ' mi' : Math.round(m * 3.28084) + ' ft') + ')';
+  const txt = km + '  (' + (mi >= 1 ? mi.toFixed(mi < 10 ? 1 : 0) + ' mi' : Math.round(m * 3.28084) + ' ft') + ')';
+  if (px !== scaleShown.px) document.getElementById('scalebarline').style.width = px + 'px';
+  if (txt !== scaleShown.txt) document.getElementById('scaletxt').textContent = txt;
+  scaleShown = { px, txt };
 }
 
 function fmt(n) { return n >= 100 ? Math.round(n).toLocaleString('en-US') : n.toLocaleString('en-US', { maximumFractionDigits: 1 }); }
