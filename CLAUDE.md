@@ -163,7 +163,8 @@ Test hook: `RA_TEST_DROP_WAYS=id,id ONLY=<region> python3 build.py` removes ways
 
 - File size: the main region files total about 5.8 MB raw (1.8 MB gzip) and roads 2.8 MB raw (1.1 MB gzip), fetched only with the Streets layer; it was 19 MB raw / 6 MB gzip with roads inside every file. Ideas left: delta + varint binary instead of JSON text, dual-carriageway merging, per-zoom road tiles.
 - Paris is Paris plus Hauts-de-Seine, Seine-Saint-Denis, Val-de-Marne (about 763 km2), not the Metropole du Grand Paris (no boundary relation found).
-- Shanghai (about 7,400 km2) and Jiangnan (about 32,700 km2) overstate land: estuary and offshore water inside the extraction box is counted as land.
+- Shanghai (about 7,400 km2) and Jiangnan (about 42,600 km2) overstate land: estuary and offshore water inside the extraction box is counted as land.
+- Jiangnan is Shanghai, Suzhou and Hangzhou plus Jiaxing (relation 3308626) and Huzhou (3149738), so the land and rail between the three cities are included (recut 2026-10-17; before it was the three prefectures only, with a gap in the middle).
 - Seoul+ is about 12,000 km2 (earlier estimate 11,800).
 - London and Paris still use the default major interchange size of 4; they may be as cluttered as New York was.
 - Paris main-station names are the least verified; add missing ones to `MAIN_BY_GROUP['par']`.

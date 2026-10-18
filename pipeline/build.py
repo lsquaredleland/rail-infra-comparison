@@ -307,7 +307,7 @@ REGIONS = [
          anchor=(40.7580, -73.9855), anchor_name='Times Square', streets=1, big=True),
     dict(id='shanghai', name='Shanghai', sub='Whole municipality', group='sh', rels=[913067], clip=BB['sh'],
          anchor=(31.2304, 121.4737), anchor_name="People's Square", streets=2, big=True),
-    dict(id='jiangnan', name='Jiangnan', sub='Shanghai, Hangzhou and Suzhou', group='sh', rels=[913067, 3221112, 4430941], subs=True, clip=BB['sh'],
+    dict(id='jiangnan', name='Jiangnan', sub='Shanghai, Suzhou, Hangzhou and the land between', group='sh', rels=[913067, 3221112, 4430941, 3308626, 3149738], subs=True, clip=BB['sh'],
          anchor=(31.2304, 121.4737), anchor_name="People's Square", streets=1, big=True),
 ]
 
